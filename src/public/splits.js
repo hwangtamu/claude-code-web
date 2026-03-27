@@ -139,7 +139,6 @@ class Split {
                 break;
                 
             case 'claude_started':
-            case 'codex_started':
             case 'agent_started':
                 console.log(`[Split ${this.index}] Agent started`);
                 break;

@@ -7,7 +7,6 @@ const WebSocket = require('ws');
 const cors = require('cors');
 const { v4: uuidv4 } = require('uuid');
 const ClaudeBridge = require('./claude-bridge');
-const CodexBridge = require('./codex-bridge');
 const AgentBridge = require('./agent-bridge');
 const SessionStore = require('./utils/session-store');
 const UsageReader = require('./usage-reader');
@@ -16,6 +15,7 @@ const UsageAnalytics = require('./usage-analytics');
 class ClaudeCodeWebServer {
   constructor(options = {}) {
     this.port = options.port || 32352;
+    this.host = options.host || '0.0.0.0';
     this.auth = options.auth;
     this.noAuth = options.noAuth || false;
     this.dev = options.dev || false;
@@ -25,14 +25,15 @@ class ClaudeCodeWebServer {
     this.folderMode = options.folderMode !== false; // Default to true
     this.selectedWorkingDir = null;
     this.baseFolder = process.cwd(); // The folder where the app runs from
+    // User sandbox base path
+    this.sandboxBase = '/local_disk/services/workspace';
     // Session duration in hours (default to 5 hours from first message)
     this.sessionDurationHours = parseFloat(process.env.CLAUDE_SESSION_HOURS || options.sessionHours || 5);
     
     this.app = express();
-    this.claudeSessions = new Map(); // Persistent sessions (claude, codex, or agent)
+    this.claudeSessions = new Map(); // Persistent sessions (claude or agent)
     this.webSocketConnections = new Map(); // Maps WebSocket connection ID to session info
     this.claudeBridge = new ClaudeBridge();
-    this.codexBridge = new CodexBridge();
     this.agentBridge = new AgentBridge();
     this.sessionStore = new SessionStore();
     this.usageReader = new UsageReader(this.sessionDurationHours);
@@ -48,10 +49,19 @@ class ClaudeCodeWebServer {
     // Assistant aliases (for UI display only)
     this.aliases = {
       claude: options.claudeAlias || process.env.CLAUDE_ALIAS || 'Claude',
-      codex: options.codexAlias || process.env.CODEX_ALIAS || 'Codex',
       agent: options.agentAlias || process.env.AGENT_ALIAS || 'Cursor'
     };
-    
+
+    // Create sandbox base directory if it doesn't exist
+    try {
+      if (!fs.existsSync(this.sandboxBase)) {
+        fs.mkdirSync(this.sandboxBase, { recursive: true });
+        console.log(`Created sandbox base directory: ${this.sandboxBase}`);
+      }
+    } catch (error) {
+      console.error('Failed to create sandbox base directory:', error);
+    }
+
     this.setupExpress();
     this.loadPersistedSessions();
     this.setupAutoSave();
@@ -113,21 +123,59 @@ class ClaudeCodeWebServer {
     }
   }
 
-  validatePath(targetPath) {
+  validatePath(targetPath, userId = null) {
     if (!targetPath) {
       return { valid: false, error: 'Path is required' };
     }
-    
+
     const resolvedPath = path.resolve(targetPath);
-    
+
+    // If userId is provided, validate against user's sandbox
+    if (userId) {
+      const sandboxPath = this.getUserSandboxPath(userId);
+      if (!resolvedPath.startsWith(sandboxPath)) {
+        return {
+          valid: false,
+          error: 'Access denied: Path is outside your workspace'
+        };
+      }
+      return { valid: true, path: resolvedPath };
+    }
+
+    // Otherwise validate against baseFolder (legacy behavior)
     if (!this.isPathWithinBase(resolvedPath)) {
-      return { 
-        valid: false, 
-        error: 'Access denied: Path is outside the allowed directory' 
+      return {
+        valid: false,
+        error: 'Access denied: Path is outside the allowed directory'
       };
     }
-    
+
     return { valid: true, path: resolvedPath };
+  }
+
+  getUserSandboxPath(userId) {
+    return path.join(this.sandboxBase, userId);
+  }
+
+  async createUserSandbox(userId) {
+    const sandboxPath = this.getUserSandboxPath(userId);
+
+    // Validate userId format (alphanumeric, underscore, hyphen only)
+    if (!/^[a-zA-Z0-9_.-]+$/.test(userId)) {
+      return { success: false, message: 'Invalid user ID format' };
+    }
+
+    try {
+      // Create sandbox directory if it doesn't exist
+      if (!fs.existsSync(sandboxPath)) {
+        fs.mkdirSync(sandboxPath, { recursive: true });
+        console.log(`Created user sandbox: ${sandboxPath}`);
+      }
+      return { success: true, path: sandboxPath };
+    } catch (error) {
+      console.error('Failed to create user sandbox:', error);
+      return { success: false, message: error.message };
+    }
   }
 
   setupExpress() {
@@ -219,14 +267,17 @@ class ClaudeCodeWebServer {
 
     // List all Claude sessions
     this.app.get('/api/sessions/list', (req, res) => {
+      const userId = req.headers['x-user-id'] || req.query.userId;
       const sessionList = Array.from(this.claudeSessions.entries()).map(([id, session]) => ({
         id,
         name: session.name,
+        userId: session.userId, // Include owner so clients can display it
         created: session.created,
         active: session.active,
         workingDir: session.workingDir,
         connectedClients: session.connections.size,
-        lastActivity: session.lastActivity
+        lastActivity: session.lastActivity,
+        isOwner: userId ? session.userId === userId : true
       }));
       res.json({ sessions: sessionList });
     });
@@ -234,30 +285,37 @@ class ClaudeCodeWebServer {
     // Create a new session
     this.app.post('/api/sessions/create', (req, res) => {
       const { name, workingDir } = req.body;
+      const userId = req.headers['x-user-id'] || req.query.userId;
       const sessionId = uuidv4();
-      
+
       // Validate working directory if provided
-      let validWorkingDir = this.baseFolder;
+      let validWorkingDir;
       if (workingDir) {
-        const validation = this.validatePath(workingDir);
+        const validation = this.validatePath(workingDir, userId);
         if (!validation.valid) {
-          return res.status(403).json({ 
+          return res.status(403).json({
             error: validation.error,
-            message: 'Cannot create session with working directory outside the allowed area' 
+            message: 'Cannot create session with working directory outside the allowed area'
           });
         }
         validWorkingDir = validation.path;
+      } else if (userId) {
+        // Default to user's sandbox
+        validWorkingDir = this.getUserSandboxPath(userId);
       } else if (this.selectedWorkingDir) {
         validWorkingDir = this.selectedWorkingDir;
+      } else {
+        validWorkingDir = this.baseFolder;
       }
-      
+
       const session = {
         id: sessionId,
+        userId: userId, // Owner of this session
         name: name || `Session ${new Date().toLocaleString()}`,
         created: new Date(),
         lastActivity: new Date(),
         active: false,
-        agent: null, // 'claude' | 'codex' when started
+        agent: null, // 'claude' or 'agent' when started
         workingDir: validWorkingDir,
         connections: new Set(),
         outputBuffer: [],
@@ -332,8 +390,32 @@ class ClaudeCodeWebServer {
       
       // Save sessions after deletion
       this.saveSessionsToDisk();
-      
+
       res.json({ success: true, message: 'Session deleted' });
+    });
+
+    // Create user sandbox
+    this.app.post('/api/user/create-sandbox', async (req, res) => {
+      const { userId } = req.body;
+
+      if (!userId) {
+        return res.status(400).json({ success: false, message: 'User ID is required' });
+      }
+
+      const result = await this.createUserSandbox(userId);
+      res.json(result);
+    });
+
+    // Get user sandbox path
+    this.app.get('/api/user/sandbox', (req, res) => {
+      const userId = req.query.userId || req.headers['x-user-id'];
+
+      if (!userId) {
+        return res.status(400).json({ error: 'User ID is required' });
+      }
+
+      const sandboxPath = this.getUserSandboxPath(userId);
+      res.json({ sandboxPath, userId });
     });
 
     this.app.get('/api/config', (req, res) => {
@@ -347,30 +429,36 @@ class ClaudeCodeWebServer {
 
     this.app.post('/api/create-folder', (req, res) => {
       const { parentPath, folderName } = req.body;
-      
+      const userId = req.headers['x-user-id'] || req.query.userId;
+
       if (!folderName || !folderName.trim()) {
         return res.status(400).json({ message: 'Folder name is required' });
       }
-      
+
       if (folderName.includes('/') || folderName.includes('\\')) {
         return res.status(400).json({ message: 'Invalid folder name' });
       }
-      
-      const basePath = parentPath || this.baseFolder;
+
+      let basePath;
+      if (userId) {
+        basePath = parentPath || this.getUserSandboxPath(userId);
+      } else {
+        basePath = parentPath || this.baseFolder;
+      }
       const fullPath = path.join(basePath, folderName);
-      
-      // Validate that the parent path and resulting path are within base folder
-      const parentValidation = this.validatePath(basePath);
+
+      // Validate that the parent path and resulting path are within user's sandbox
+      const parentValidation = this.validatePath(basePath, userId);
       if (!parentValidation.valid) {
-        return res.status(403).json({ 
-          message: 'Cannot create folder outside the allowed area' 
+        return res.status(403).json({
+          message: 'Cannot create folder outside the allowed area'
         });
       }
-      
-      const fullValidation = this.validatePath(fullPath);
+
+      const fullValidation = this.validatePath(fullPath, userId);
       if (!fullValidation.valid) {
-        return res.status(403).json({ 
-          message: 'Cannot create folder outside the allowed area' 
+        return res.status(403).json({
+          message: 'Cannot create folder outside the allowed area'
         });
       }
       
@@ -397,14 +485,23 @@ class ClaudeCodeWebServer {
     });
 
     this.app.get('/api/folders', (req, res) => {
-      const requestedPath = req.query.path || this.baseFolder;
-      
+      const userId = req.headers['x-user-id'] || req.query.userId;
+      let requestedPath;
+
+      if (userId) {
+        // User with ID - restrict to their sandbox
+        requestedPath = req.query.path || this.getUserSandboxPath(userId);
+      } else {
+        // Legacy: no user ID - use baseFolder
+        requestedPath = req.query.path || this.baseFolder;
+      }
+
       // Validate the requested path
-      const validation = this.validatePath(requestedPath);
+      const validation = this.validatePath(requestedPath, userId);
       if (!validation.valid) {
-        return res.status(403).json({ 
+        return res.status(403).json({
           error: validation.error,
-          message: 'Access to this directory is not allowed' 
+          message: 'Access to this directory is not allowed'
         });
       }
       
@@ -480,29 +577,34 @@ class ClaudeCodeWebServer {
     this.app.post('/api/folders/select', (req, res) => {
       try {
         const { path: selectedPath } = req.body;
-        
+        const userId = req.headers['x-user-id'] || req.query.userId;
+
         // Validate the path
-        const validation = this.validatePath(selectedPath);
+        const validation = this.validatePath(selectedPath, userId);
         if (!validation.valid) {
-          return res.status(403).json({ 
+          return res.status(403).json({
             error: validation.error,
-            message: 'Cannot select directory outside the allowed area' 
+            message: 'Cannot select directory outside the allowed area'
           });
         }
-        
+
         const validatedPath = validation.path;
-        
+
         // Verify the path exists and is a directory
         if (!fs.existsSync(validatedPath) || !fs.statSync(validatedPath).isDirectory()) {
-          return res.status(400).json({ 
-            error: 'Invalid directory path' 
+          return res.status(400).json({
+            error: 'Invalid directory path'
           });
         }
-        
-        // Store the selected working directory
-        this.selectedWorkingDir = validatedPath;
-        
-        res.json({ 
+
+        // Store the selected working directory (per-user if userId provided)
+        if (userId) {
+          this.selectedWorkingDir = validatedPath;
+        } else {
+          this.selectedWorkingDir = validatedPath;
+        }
+
+        res.json({
           success: true,
           workingDir: this.selectedWorkingDir
         });
@@ -568,7 +670,7 @@ class ClaudeCodeWebServer {
     });
 
     return new Promise((resolve, reject) => {
-      server.listen(this.port, (err) => {
+      server.listen(this.port, this.host, (err) => {
         if (err) {
           reject(err);
         } else {
@@ -583,9 +685,10 @@ class ClaudeCodeWebServer {
     const wsId = uuidv4(); // Unique ID for this WebSocket connection
     const url = new URL(req.url, `ws://localhost`);
     const claudeSessionId = url.searchParams.get('sessionId');
-    
+    const userId = url.searchParams.get('userId');
+
     if (this.dev) {
-      console.log(`New WebSocket connection: ${wsId}`);
+      console.log(`New WebSocket connection: ${wsId}, userId: ${userId}`);
       if (claudeSessionId) {
         console.log(`Joining Claude session: ${claudeSessionId}`);
       }
@@ -596,6 +699,7 @@ class ClaudeCodeWebServer {
       id: wsId,
       ws,
       claudeSessionId: null,
+      userId: userId,
       created: new Date()
     };
     this.webSocketConnections.set(wsId, wsInfo);
@@ -661,9 +765,6 @@ class ClaudeCodeWebServer {
       case 'start_claude':
         await this.startClaude(wsId, data.options || {});
         break;
-      case 'start_codex':
-        await this.startCodex(wsId, data.options || {});
-        break;
       case 'start_agent':
         await this.startAgent(wsId, data.options || {});
         break;
@@ -676,9 +777,7 @@ class ClaudeCodeWebServer {
             // Only send if an agent is running in this session
             if (session.active && session.agent) {
               try {
-                if (session.agent === 'codex') {
-                  await this.codexBridge.sendInput(wsInfo.claudeSessionId, data.data);
-                } else if (session.agent === 'agent') {
+                if (session.agent === 'agent') {
                   await this.agentBridge.sendInput(wsInfo.claudeSessionId, data.data);
                 } else {
                   await this.claudeBridge.sendInput(wsInfo.claudeSessionId, data.data);
@@ -710,9 +809,7 @@ class ClaudeCodeWebServer {
             // Only resize if an agent is actually running
             if (session.active && session.agent) {
               try {
-                if (session.agent === 'codex') {
-                  await this.codexBridge.resize(wsInfo.claudeSessionId, data.cols, data.rows);
-                } else if (session.agent === 'agent') {
+                if (session.agent === 'agent') {
                   await this.agentBridge.resize(wsInfo.claudeSessionId, data.cols, data.rows);
                 } else {
                   await this.claudeBridge.resize(wsInfo.claudeSessionId, data.cols, data.rows);
@@ -730,9 +827,7 @@ class ClaudeCodeWebServer {
       case 'stop':
         if (wsInfo.claudeSessionId) {
           const session = this.claudeSessions.get(wsInfo.claudeSessionId);
-          if (session?.agent === 'codex') {
-            await this.stopCodex(wsInfo.claudeSessionId);
-          } else if (session?.agent === 'agent') {
+          if (session?.agent === 'agent') {
             await this.stopAgent(wsInfo.claudeSessionId);
           } else {
             await this.stopClaude(wsInfo.claudeSessionId);
@@ -759,26 +854,47 @@ class ClaudeCodeWebServer {
     const wsInfo = this.webSocketConnections.get(wsId);
     if (!wsInfo) return;
 
+    const userId = wsInfo.userId;
+
     // Validate working directory if provided
-    let validWorkingDir = this.baseFolder;
+    let validWorkingDir;
     if (workingDir) {
-      const validation = this.validatePath(workingDir);
+      const validation = this.validatePath(workingDir, userId);
       if (!validation.valid) {
         this.sendToWebSocket(wsInfo.ws, {
           type: 'error',
-          message: 'Cannot create session with working directory outside the allowed area'
+          message: validation.error || 'Cannot create session with working directory outside the allowed area'
         });
         return;
       }
       validWorkingDir = validation.path;
-    } else if (this.selectedWorkingDir) {
-      validWorkingDir = this.selectedWorkingDir;
+    } else if (userId) {
+      // Default to user's sandbox if userId is provided
+      validWorkingDir = this.getUserSandboxPath(userId);
+    } else {
+      validWorkingDir = this.baseFolder;
+    }
+
+    // Create the working directory if it doesn't exist
+    try {
+      if (!fs.existsSync(validWorkingDir)) {
+        fs.mkdirSync(validWorkingDir, { recursive: true });
+        console.log(`Created working directory: ${validWorkingDir}`);
+      }
+    } catch (error) {
+      console.error('Failed to create working directory:', error);
+      this.sendToWebSocket(wsInfo.ws, {
+        type: 'error',
+        message: `Failed to create working directory: ${error.message}`
+      });
+      return;
     }
 
     // Create new Claude session
     const sessionId = uuidv4();
     const session = {
       id: sessionId,
+      userId: userId, // Owner of this session
       name: name || `Session ${new Date().toLocaleString()}`,
       created: new Date(),
       lastActivity: new Date(),
@@ -797,7 +913,7 @@ class ClaudeCodeWebServer {
       },
       maxBufferSize: 1000
     };
-    
+
     this.claudeSessions.set(sessionId, session);
     wsInfo.claudeSessionId = sessionId;
     
@@ -821,6 +937,16 @@ class ClaudeCodeWebServer {
       this.sendToWebSocket(wsInfo.ws, {
         type: 'error',
         message: 'Session not found'
+      });
+      return;
+    }
+
+    // Check if user can join - they can view all sessions but only join their own
+    if (wsInfo.userId && session.userId && wsInfo.userId !== session.userId) {
+      // User can see the session in the list but cannot join it
+      this.sendToWebSocket(wsInfo.ws, {
+        type: 'error',
+        message: 'You can only join your own sessions'
       });
       return;
     }
@@ -974,92 +1100,6 @@ class ClaudeCodeWebServer {
     });
   }
 
-  async startCodex(wsId, options) {
-    const wsInfo = this.webSocketConnections.get(wsId);
-    if (!wsInfo || !wsInfo.claudeSessionId) {
-      this.sendToWebSocket(wsInfo.ws, {
-        type: 'error',
-        message: 'No session joined'
-      });
-      return;
-    }
-
-    const session = this.claudeSessions.get(wsInfo.claudeSessionId);
-    if (!session) return;
-
-    if (session.active) {
-      this.sendToWebSocket(wsInfo.ws, {
-        type: 'error',
-        message: 'An agent is already running in this session'
-      });
-      return;
-    }
-
-    const sessionId = wsInfo.claudeSessionId;
-    try {
-      await this.codexBridge.startSession(sessionId, {
-        workingDir: session.workingDir,
-        onOutput: (data) => {
-          const currentSession = this.claudeSessions.get(sessionId);
-          if (!currentSession) return;
-          currentSession.outputBuffer.push(data);
-          if (currentSession.outputBuffer.length > currentSession.maxBufferSize) {
-            currentSession.outputBuffer.shift();
-          }
-          this.broadcastToSession(sessionId, { type: 'output', data });
-        },
-        onExit: (code, signal) => {
-          const currentSession = this.claudeSessions.get(sessionId);
-          if (currentSession) {
-            currentSession.active = false;
-            currentSession.agent = null;
-          }
-          this.broadcastToSession(sessionId, { type: 'exit', code, signal });
-        },
-        onError: (error) => {
-          const currentSession = this.claudeSessions.get(sessionId);
-          if (currentSession) {
-            currentSession.active = false;
-            currentSession.agent = null;
-          }
-          this.broadcastToSession(sessionId, { type: 'error', message: error.message });
-        },
-        ...options
-      });
-
-      session.active = true;
-      session.agent = 'codex';
-      session.lastActivity = new Date();
-      if (!session.sessionStartTime) {
-        session.sessionStartTime = new Date();
-      }
-
-      this.broadcastToSession(sessionId, {
-        type: 'codex_started',
-        sessionId: sessionId
-      });
-
-    } catch (error) {
-      if (this.dev) {
-        console.error(`Error starting Codex in session ${wsInfo.claudeSessionId}:`, error);
-      }
-      this.sendToWebSocket(wsInfo.ws, {
-        type: 'error',
-        message: `Failed to start Codex Code: ${error.message}`
-      });
-    }
-  }
-
-  async stopCodex(sessionId) {
-    const session = this.claudeSessions.get(sessionId);
-    if (!session || !session.active) return;
-    await this.codexBridge.stopSession(sessionId);
-    session.active = false;
-    session.agent = null;
-    session.lastActivity = new Date();
-    this.broadcastToSession(sessionId, { type: 'codex_stopped' });
-  }
-
   async startAgent(wsId, options) {
     const wsInfo = this.webSocketConnections.get(wsId);
     if (!wsInfo || !wsInfo.claudeSessionId) {
@@ -1207,12 +1247,10 @@ class ClaudeCodeWebServer {
     // Stop all sessions
     for (const [sessionId, session] of this.claudeSessions.entries()) {
       if (session.active) {
-        if (session.agent === 'codex') {
-          this.codexBridge.stopSession(sessionId);
-        } else if (session.agent === 'agent') {
+        if (session.agent === 'agent') {
           this.agentBridge.stopSession(sessionId);
         } else {
-        this.claudeBridge.stopSession(sessionId);
+          this.claudeBridge.stopSession(sessionId);
         }
       }
     }

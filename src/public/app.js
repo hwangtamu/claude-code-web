@@ -19,12 +19,18 @@ class ClaudeCodeWebInterface {
         this.planDetector = null;
         this.planModal = null;
         // Aliases for assistants (populated from /api/config)
-        this.aliases = { claude: 'Claude', codex: 'Codex' };
-        
-        
+        this.aliases = { claude: 'Claude' };
+
+        // User ID for sandboxed workspace
+        this.userId = localStorage.getItem('cc-web-userid') || sessionStorage.getItem('cc-web-userid');
+
+        // Flag to track intentional disconnections
+        this.intentionalDisconnect = false;
+
+
         // Initialize the session tab manager
         this.sessionTabManager = null;
-        
+
         // Usage stats
         this.usageStats = null;
         this.usageUpdateTimer = null;
@@ -39,11 +45,13 @@ class ClaudeCodeWebInterface {
     // Helper method for authenticated fetch calls
     async authFetch(url, options = {}) {
         const authHeaders = window.authManager.getAuthHeaders();
+        const userId = this.userId || window.authManager.getUserId();
         const mergedOptions = {
             ...options,
             headers: {
                 ...authHeaders,
-                ...(options.headers || {})
+                ...(options.headers || {}),
+                ...(userId ? { 'x-user-id': userId } : {})
             }
         };
         const response = await fetch(url, mergedOptions);
@@ -61,6 +69,52 @@ class ClaudeCodeWebInterface {
     }
 
     async init() {
+        // Listen for userIdSet event (from auth.js)
+        window.addEventListener('userIdSet', (event) => {
+            console.log('[Init] User ID set:', event.detail.userId);
+            this.userId = event.detail.userId;
+            // Reinitialize after user ID is set
+            this.continueInit();
+        });
+
+        // Check if we have a userId
+        if (!this.userId) {
+            // User ID prompt will be shown by authManager.initialize()
+            this.userId = window.authManager.getUserId();
+            if (!this.userId) {
+                console.log('[Init] No user ID, waiting for user ID prompt...');
+                // Trigger auth manager to show user ID prompt
+                const authenticated = await window.authManager.initialize();
+                if (!authenticated) {
+                    // User ID prompt is shown, stop initialization
+                    console.log('[Init] User ID prompt shown, waiting for input...');
+                    return;
+                }
+                // Auth passed but check if we now have userId
+                this.userId = window.authManager.getUserId();
+                if (!this.userId) {
+                    console.log('[Init] Still no user ID, waiting for user ID prompt...');
+                    return;
+                }
+            }
+
+            // Create sandbox if it doesn't exist
+            try {
+                await fetch('/api/user/create-sandbox', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ userId: this.userId })
+                });
+            } catch (e) {
+                console.log('[Init] Sandbox creation skipped:', e.message);
+            }
+        }
+
+        // Continue with initialization
+        await this.continueInit();
+    }
+
+    async continueInit() {
         // Check authentication first
         const authenticated = await window.authManager.initialize();
         if (!authenticated) {
@@ -68,7 +122,15 @@ class ClaudeCodeWebInterface {
             console.log('[Init] Authentication required, waiting for login...');
             return;
         }
-        
+
+        // Ensure we have userId
+        this.userId = window.authManager.getUserId();
+        if (!this.userId) {
+            console.log('[Init] No user ID, showing user ID prompt...');
+            window.authManager.showUserIdPrompt();
+            return;
+        }
+
         await this.loadConfig();
         this.setupTerminal();
         this.setupUI();
@@ -131,8 +193,7 @@ class ClaudeCodeWebInterface {
                 const cfg = await res.json();
                 if (cfg?.aliases) {
                     this.aliases = {
-                        claude: cfg.aliases.claude || 'Claude',
-                        codex: cfg.aliases.codex || 'Codex'
+                        claude: cfg.aliases.claude || 'Claude'
                     };
                 }
                 if (typeof cfg.folderMode === 'boolean') {
@@ -147,7 +208,6 @@ class ClaudeCodeWebInterface {
             return this.aliases[kind];
         }
         // Default aliases
-        if (kind === 'codex') return 'Codex';
         if (kind === 'agent') return 'Cursor';
         return 'Claude';
     }
@@ -156,14 +216,8 @@ class ClaudeCodeWebInterface {
         // Start prompt buttons
         const startBtn = document.getElementById('startBtn');
         const dangerousSkipBtn = document.getElementById('dangerousSkipBtn');
-        const startCodexBtn = document.getElementById('startCodexBtn');
-        const dangerousCodexBtn = document.getElementById('dangerousCodexBtn');
-        const startAgentBtn = document.getElementById('startAgentBtn');
         if (startBtn) startBtn.textContent = `Start ${this.getAlias('claude')}`;
         if (dangerousSkipBtn) dangerousSkipBtn.textContent = `Dangerous ${this.getAlias('claude')}`;
-        if (startCodexBtn) startCodexBtn.textContent = `Start ${this.getAlias('codex')}`;
-        if (dangerousCodexBtn) dangerousCodexBtn.textContent = `Dangerous ${this.getAlias('codex')}`;
-        if (startAgentBtn) startAgentBtn.textContent = `Start ${this.getAlias('agent')}`;
 
         // Plan modal title
         const planTitle = document.querySelector('#planModal .modal-header h2');
@@ -435,24 +489,19 @@ class ClaudeCodeWebInterface {
     setupUI() {
         const startBtn = document.getElementById('startBtn');
         const dangerousSkipBtn = document.getElementById('dangerousSkipBtn');
-        const startCodexBtn = document.getElementById('startCodexBtn');
-        const dangerousCodexBtn = document.getElementById('dangerousCodexBtn');
-        const startAgentBtn = document.getElementById('startAgentBtn');
         const settingsBtn = document.getElementById('settingsBtn');
         const retryBtn = document.getElementById('retryBtn');
-        
+
         // Mobile menu buttons (keeping for mobile support)
         const closeMenuBtn = document.getElementById('closeMenuBtn');
         const settingsBtnMobile = document.getElementById('settingsBtnMobile');
-        
+        const switchUserBtnMobile = document.getElementById('switchUserBtnMobile');
+
         if (startBtn) startBtn.addEventListener('click', () => this.startClaudeSession());
         if (dangerousSkipBtn) dangerousSkipBtn.addEventListener('click', () => this.startClaudeSession({ dangerouslySkipPermissions: true }));
-        if (startCodexBtn) startCodexBtn.addEventListener('click', () => this.startCodexSession());
-        if (dangerousCodexBtn) dangerousCodexBtn.addEventListener('click', () => this.startCodexSession({ dangerouslySkipPermissions: true }));
-        if (startAgentBtn) startAgentBtn.addEventListener('click', () => this.startAgentSession());
         if (settingsBtn) settingsBtn.addEventListener('click', () => this.showSettings());
         if (retryBtn) retryBtn.addEventListener('click', () => this.reconnect());
-        
+
         // Tile view toggle
         // Mobile menu event listeners
         if (closeMenuBtn) closeMenuBtn.addEventListener('click', () => this.closeMobileMenu());
@@ -462,6 +511,20 @@ class ClaudeCodeWebInterface {
                 this.closeMobileMenu();
             });
         }
+        if (switchUserBtnMobile) {
+            switchUserBtnMobile.addEventListener('click', () => {
+                this.closeMobileMenu();
+                window.authManager.switchUser();
+            });
+        }
+
+        // Listen for logout event
+        window.addEventListener('userLogout', () => {
+            this.disconnect();
+            this.clearTerminal();
+            this.currentClaudeSessionId = null;
+            window.location.reload();
+        });
         
         // Mobile sessions button
         const sessionsBtnMobile = document.getElementById('sessionsBtnMobile');
@@ -484,13 +547,21 @@ class ClaudeCodeWebInterface {
         const modal = document.getElementById('settingsModal');
         const closeBtn = document.getElementById('closeSettingsBtn');
         const saveBtn = document.getElementById('saveSettingsBtn');
+        const switchUserBtn = document.getElementById('switchUserBtn');
         const fontSizeSlider = document.getElementById('fontSize');
         const fontSizeValue = document.getElementById('fontSizeValue');
         const showTokenStatsCheckbox = document.getElementById('showTokenStats');
 
         closeBtn.addEventListener('click', () => this.hideSettings());
         saveBtn.addEventListener('click', () => this.saveSettings());
-        
+
+        if (switchUserBtn) {
+            switchUserBtn.addEventListener('click', () => {
+                this.hideSettings();
+                window.authManager.switchUser();
+            });
+        }
+
         fontSizeSlider.addEventListener('input', (e) => {
             fontSizeValue.textContent = e.target.value + 'px';
         });
@@ -536,7 +607,10 @@ class ClaudeCodeWebInterface {
             
             try {
                 this.socket = new WebSocket(wsUrl);
-                
+
+                // Reset intentional disconnect flag
+                this.intentionalDisconnect = false;
+
                 this.socket.onopen = () => {
                     this.reconnectAttempts = 0;
                     this.updateStatus('Connected');
@@ -565,8 +639,15 @@ class ClaudeCodeWebInterface {
             
             this.socket.onclose = (event) => {
                 this.updateStatus('Disconnected');
+
+                // If intentionally disconnected, just show folder browser without error
+                if (this.intentionalDisconnect) {
+                    this.intentionalDisconnect = false;
+                    return;
+                }
+
                 // Reconnect button removed with header
-                
+
                 if (!event.wasClean && this.reconnectAttempts < this.maxReconnectAttempts) {
                     setTimeout(() => this.reconnect(), this.reconnectDelay * Math.pow(2, this.reconnectAttempts));
                     this.reconnectAttempts++;
@@ -590,6 +671,7 @@ class ClaudeCodeWebInterface {
     }
 
     disconnect() {
+        this.intentionalDisconnect = true;
         if (this.socket) {
             this.socket.close();
             this.socket = null;
@@ -722,14 +804,6 @@ class ClaudeCodeWebInterface {
                     this.sessionTabManager.updateTabStatus(this.currentClaudeSessionId, 'active');
                 }
                 break;
-            case 'codex_started':
-                this.hideOverlay();
-                this.loadSessions();
-                this.requestUsageStats();
-                if (this.sessionTabManager && this.currentClaudeSessionId) {
-                    this.sessionTabManager.updateTabStatus(this.currentClaudeSessionId, 'active');
-                }
-                break;
             case 'agent_started':
                 this.hideOverlay();
                 this.loadSessions();
@@ -744,11 +818,6 @@ class ClaudeCodeWebInterface {
                 // Show start prompt to allow restarting Claude in this session
                 this.showOverlay('startPrompt');
                 this.loadSessions(); // Refresh session list
-                break;
-            case 'codex_stopped':
-                this.terminal.writeln(`\r\n\x1b[33mCodex Code stopped\x1b[0m`);
-                this.showOverlay('startPrompt');
-                this.loadSessions();
                 break;
             case 'agent_stopped':
                 this.terminal.writeln(`\r\n\x1b[33m${this.getAlias('agent')} stopped\x1b[0m`);
@@ -852,52 +921,6 @@ class ClaudeCodeWebInterface {
         const loadingText = options.dangerouslySkipPermissions ? 
             `Starting ${this.getAlias('claude')} (skipping permissions)...` : 
             `Starting ${this.getAlias('claude')}...`;
-        document.getElementById('loadingSpinner').querySelector('p').textContent = loadingText;
-    }
-
-    startCodexSession(options = {}) {
-        // If no session, create one first
-        if (!this.currentClaudeSessionId) {
-            const sessionName = `Session ${new Date().toLocaleString()}`;
-            this.send({
-                type: 'create_session',
-                name: sessionName,
-                workingDir: this.selectedWorkingDir
-            });
-            // Wait for session creation, then start Codex
-            setTimeout(() => {
-                this.send({ type: 'start_codex', options });
-            }, 500);
-        } else {
-            this.send({ type: 'start_codex', options });
-        }
-
-        this.showOverlay('loadingSpinner');
-        const loadingText = options.dangerouslySkipPermissions ?
-            `Starting ${this.getAlias('codex')} (bypassing approvals and sandbox)...` :
-            `Starting ${this.getAlias('codex')}...`;
-        document.getElementById('loadingSpinner').querySelector('p').textContent = loadingText;
-    }
-
-    startAgentSession(options = {}) {
-        // If no session, create one first
-        if (!this.currentClaudeSessionId) {
-            const sessionName = `Session ${new Date().toLocaleString()}`;
-            this.send({
-                type: 'create_session',
-                name: sessionName,
-                workingDir: this.selectedWorkingDir
-            });
-            // Wait for session creation, then start Agent
-            setTimeout(() => {
-                this.send({ type: 'start_agent', options });
-            }, 500);
-        } else {
-            this.send({ type: 'start_agent', options });
-        }
-        
-        this.showOverlay('loadingSpinner');
-        const loadingText = `Starting ${this.getAlias('agent')}...`;
         document.getElementById('loadingSpinner').querySelector('p').textContent = loadingText;
     }
 
@@ -1104,12 +1127,15 @@ class ClaudeCodeWebInterface {
     async showFolderBrowser() {
         const modal = document.getElementById('folderBrowserModal');
         modal.classList.add('active');
-        
+
+        // Mark as intentional to suppress connection error
+        this.intentionalDisconnect = true;
+
         // Prevent body scroll on mobile when modal is open
         if (this.isMobile) {
             document.body.style.overflow = 'hidden';
         }
-        
+
         // Load home directory by default
         await this.loadFolders();
     }
@@ -1137,7 +1163,11 @@ class ClaudeCodeWebInterface {
         const params = new URLSearchParams();
         if (path) params.append('path', path);
         if (showHidden) params.append('showHidden', 'true');
-        
+
+        // Add userId to params
+        const userId = this.userId || window.authManager.getUserId();
+        if (userId) params.append('userId', userId);
+
         try {
             const response = await this.authFetch(`/api/folders?${params}`);
             if (!response.ok) {

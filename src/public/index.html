@@ -100,6 +100,7 @@
                 <button id="reconnectBtnMobile" class="mobile-menu-btn" disabled>Reconnect</button>
                 <button id="clearBtnMobile" class="mobile-menu-btn">Clear Terminal</button>
                 <button id="settingsBtnMobile" class="mobile-menu-btn">Settings</button>
+                <button id="switchUserBtnMobile" class="mobile-menu-btn">Switch User</button>
             </div>
         </div>
 
@@ -124,9 +125,6 @@
                     <div class="start-buttons">
                         <button id="startBtn" class="btn btn-primary">Start Claude</button>
                         <button id="dangerousSkipBtn" class="btn btn-danger" title="Dangerously skip permissions. Use with caution.">Dangerous Claude</button>
-                        <button id="startCodexBtn" class="btn btn-primary">Start Codex</button>
-                        <button id="dangerousCodexBtn" class="btn btn-danger" title="Bypass approvals and sandbox. Use with caution.">Dangerous Codex</button>
-                        <button id="startAgentBtn" class="btn btn-primary">Start Cursor</button>
                     </div>
                 </div>
                 <div class="error-message" id="errorMessage" style="display: none;">
@@ -162,6 +160,7 @@
                     </div>
                 </div>
                 <div class="modal-footer">
+                    <button class="btn btn-secondary" id="switchUserBtn">Switch User</button>
                     <button class="btn btn-primary" id="saveSettingsBtn">Save Settings</button>
                 </div>
             </div>

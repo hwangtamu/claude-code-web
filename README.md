@@ -37,6 +37,8 @@ npx claude-code-web --disable-auth
 - 💾 **Session Persistence** - Sessions remain active even when disconnecting
 - 📜 **Output Buffering** - Reconnect and see previous output from your session
 - 🔀 **VS Code-Style Split View** - Drag tabs to create side-by-side terminals for different sessions
+- 👥 **Multi-User Support** - Each user has a private sandboxed workspace
+- 🔄 **User Switching** - Switch between users without losing session data
 
 ## Installation
 
@@ -143,6 +145,31 @@ node bin/cc-web.js --port 8080
 node bin/cc-web.js --auth YOUR_TOKEN
 ```
 
+## Multi-User Support
+
+### Overview
+Claude Code Web supports multiple users with isolated, sandboxed workspaces. Each user gets their own private directory and can only access their own sessions.
+
+### How It Works
+1. When a user first accesses the app, they're prompted to enter a username
+2. A personal sandbox is created at `/local_disk/services/workspace/<username>/`
+3. Users can only access files and directories within their sandbox
+4. Sessions are tied to users - you can see all sessions but can only interact with your own
+
+### Switching Users
+- Click the **Settings** icon (⚙️) in the header
+- Click **Switch User** to log out and switch to a different account
+- On mobile, use the hamburger menu (☰) to access **Switch User**
+
+### Sandbox Location
+- Default: `/local_disk/services/workspace/<username>/`
+- Each user's working directory is automatically created when needed
+
+### Session Visibility
+- All users can see the list of all sessions (public)
+- Users can only join and interact with their own sessions
+- Session ownership is tracked by user ID
+
 ## Multi-Session Features
 
 ### Creating and Managing Sessions
@@ -204,6 +231,8 @@ node bin/cc-web.js --auth YOUR_TOKEN
 - `POST /api/set-working-dir` - Set working directory
 - `POST /api/create-folder` - Create new folder
 - `POST /api/close-session` - Close a session
+- `POST /api/user/create-sandbox` - Create user sandbox directory
+- `GET /api/user/sandbox` - Get user's sandbox path
 
 ### WebSocket Events
 - `create_session` - Create a new Claude session
